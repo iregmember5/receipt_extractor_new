@@ -1,3 +1,3 @@
-Django==6.0.6
+Django==5.2.6
 paddleocr
-paddlepaddle
+paddlepaddle==3.0.0django-cors-headers

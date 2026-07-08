@@ -85,3 +85,27 @@ Note: The first real OCR request can take longer because model files are loaded/
 
 Generated files are saved under `media/results/<request_id>/`.
 Uploaded images are stored under `media/uploads/`.
+
+
+
+
+# self place :
+uv venv --python 3.11.9
+cd ~/receipt_extractor_new
+source .venv/bin/activate
+
+python --version
+should this : Python 3.11.9
+
+python -m pip install -r requirements.txt
+python manage.py migrate
+
+Running both servers in parallel:
+# Terminal 1 — Django
+cd receipt_extractor_new : python manage.py runserver
+
+# Terminal 2 — Next.js
+walid-khan@walid-khan-OptiPlex-7020:~/receipt_extractor_new$ cd frontend
+walid-khan@walid-khan-OptiPlex-7020:~/receipt_extractor_new/frontend$ python3 -m http.server 3000 --bind 0.0.0.0
+
+http://localhost:3000 
