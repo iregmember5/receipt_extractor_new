@@ -9,6 +9,7 @@ venv/
 # Environment files
 .env
 
+temp_auto_push.bat
 
 # Django
 db.sqlite3
@@ -16,8 +17,8 @@ media/
 staticfiles/
 
 # IDE
-.vscode/
 
 # OCR/generated outputs
 output/
-*.log
+*.log.gitignore
+branch_structure.json
