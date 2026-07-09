@@ -231,7 +231,46 @@ Services (services.py):
 - srcRect format: { x, y, w, h } where x,y = top-left corner in image pixels
 
 -----------------------------------------------------------
-15. FILE STRUCTURE
+15. CLEANUP — removed crop/compare feature from frontend
+-----------------------------------------------------------
+Date: current session
+
+Removed from page.tsx:
+- LABELS, Label type, LABEL_COLORS constants
+- CropPreview interface
+- DrawState interface
+- cropPreviews, activeLabel, draw, originalOcr state
+- containerRef
+- imgRef (no longer needed)
+- getRelativePos()
+- handleMouseDown(), handleMouseMove(), handleMouseUp()
+- handleCompare()
+- handleCancel()
+- selectionRect computed value
+- Label buttons (Date / Description / Amount)
+- Hint text ("Select a label then draw a box...")
+- containerDiv with mouse event handlers
+- Persistent bbox overlays on image
+- Selection rect overlay while drawing
+- Cropped Regions card (crop images, polygon coords, Compare button, compare results)
+- All crop-related styles (cropGrid, cropItem, cropTag, cropImg, cropCoords, coordPoint,
+  labelBtns, labelBtn, hint, imgContainer)
+- originalOcr no longer stored or sent
+
+Kept in page.tsx:
+- preview, file, layoutText, error, loading state
+- inputRef
+- handleFileChange, handleProcess, handleSave
+- Plain image preview (no mouse events)
+- Process Receipt button
+- Reconstructed Layout Text textarea
+- Save to File button
+- Error display
+
+Backend unchanged — /api/process and Django process-receipt-json still work as before.
+
+-----------------------------------------------------------
+16. FILE STRUCTURE
 -----------------------------------------------------------
 frontend/nextjs-app/
   app/

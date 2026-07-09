@@ -1,60 +1,58 @@
 "use client";
 
 import { useRef, useState } from "react";
+import { reconstructLayoutText } from "@/lib/layoutReconstruct";
+import type { TokenMapEntry } from "@/lib/layoutReconstruct";
 
-const LABELS = ["Date", "Description", "Amount"] as const;
-type Label = typeof LABELS[number];
+type LabelType = "Date" | "Description" | "Amount";
+type Selection = { id: number; label: LabelType; text: string; polys: TokenMapEntry["poly"][]; tokenIds: number[]; edited: boolean };
+type OcrData = { rec_texts: string[]; rec_polys: number[][][]; rec_scores: number[]; image_width: number; image_height: number };
 
-const LABEL_COLORS: Record<Label, string> = {
-  Date: "#7c3aed",
-  Description: "#0070f3",
-  Amount: "#059669",
-};
+let nextId = 0;
 
-interface CropPreview {
-  label: Label;
-  dataUrl: string;
-  filename: string;
-  srcRect: { x: number; y: number; w: number; h: number };
-  poly: { tl: [number,number]; tr: [number,number]; br: [number,number]; bl: [number,number] };
-  displayRect: { left: number; top: number; width: number; height: number };
-  compareResult?: { crop_text: string; original_text: string; match: boolean; similarity: number; crop_confidence: number | null } | null;
-  comparing?: boolean;
-}
-
-interface DrawState {
-  startX: number;
-  startY: number;
-  currentX: number;
-  currentY: number;
-  active: boolean;
+function scalePolys(
+  polys: TokenMapEntry["poly"][],
+  natural: { w: number; h: number },
+  rendered: { w: number; h: number }
+): TokenMapEntry["poly"][] {
+  const scale = Math.min(rendered.w / natural.w, rendered.h / natural.h);
+  const offX = (rendered.w - natural.w * scale) / 2;
+  const offY = (rendered.h - natural.h * scale) / 2;
+  return polys.map(poly => poly.map(([x, y]) => [x * scale + offX, y * scale + offY] as [number, number]));
 }
 
 export default function Home() {
   const [preview, setPreview] = useState<string | null>(null);
   const [file, setFile] = useState<File | null>(null);
   const [layoutText, setLayoutText] = useState("");
+  const [tokenMap, setTokenMap] = useState<TokenMapEntry[]>([]);
+  const [ocrData, setOcrData] = useState<OcrData | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
-  const [cropPreviews, setCropPreviews] = useState<CropPreview[]>([]);
-  const [activeLabel, setActiveLabel] = useState<Label | null>(null);
-  const [draw, setDraw] = useState<DrawState | null>(null);
-  const [originalOcr, setOriginalOcr] = useState<object | null>(null);
+  const [activeLabel, setActiveLabel] = useState<LabelType | null>(null);
+  const [selections, setSelections] = useState<Selection[]>([]);
+  const [editTexts, setEditTexts] = useState<Record<number, string>>({});
+  const [hoveredId, setHoveredId] = useState<number | null>(null);
+  const [imgNatural, setImgNatural] = useState<{ w: number; h: number } | null>(null);
+  const [imgRendered, setImgRendered] = useState<{ w: number; h: number } | null>(null);
 
   const inputRef = useRef<HTMLInputElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
 
   function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0] ?? null;
     setFile(f);
     setPreview(f ? URL.createObjectURL(f) : null);
     setLayoutText("");
+    setTokenMap([]);
+    setOcrData(null);
+    setSelections([]);
+    setEditTexts({});
     setError("");
-    setCropPreviews([]);
     setActiveLabel(null);
-    setDraw(null);
-    setOriginalOcr(null);
+    setImgNatural(null);
+    setImgRendered(null);
   }
 
   async function handleProcess() {
@@ -62,6 +60,10 @@ export default function Home() {
     setLoading(true);
     setError("");
     setLayoutText("");
+    setTokenMap([]);
+    setOcrData(null);
+    setSelections([]);
+    setEditTexts({});
     const form = new FormData();
     form.append("receipt_image", file);
     try {
@@ -69,7 +71,8 @@ export default function Home() {
       const data = await res.json();
       if (!res.ok) { setError(data.error ?? "Unknown error"); return; }
       setLayoutText(data.layoutText ?? "");
-      setOriginalOcr(data.originalOcr ?? null);
+      setTokenMap(data.tokenMap ?? []);
+      setOcrData(data.ocrData ?? null);
     } catch (e) {
       setError(`Request failed: ${e}`);
     } finally {
@@ -77,120 +80,94 @@ export default function Home() {
     }
   }
 
-  function getRelativePos(e: React.MouseEvent) {
-    const rect = containerRef.current!.getBoundingClientRect();
-    return {
-      x: Math.max(0, Math.min(e.clientX - rect.left, rect.width)),
-      y: Math.max(0, Math.min(e.clientY - rect.top, rect.height)),
+  function handleTextareaMouseUp() {
+    if (!activeLabel || !tokenMap.length) return;
+    const ta = textareaRef.current;
+    if (!ta) return;
+    const selStart = ta.selectionStart;
+    const selEnd = ta.selectionEnd;
+    if (selStart === selEnd) return;
+    const selectedText = ta.value.substring(selStart, selEnd).trim();
+    if (!selectedText) return;
+    const toRowCol = (offset: number) => {
+      const before = ta.value.substring(0, offset);
+      const row = (before.match(/\n/g) ?? []).length;
+      const col = offset - before.lastIndexOf("\n") - 1;
+      return { row, col };
     };
+    const start = toRowCol(selStart);
+    const end = toRowCol(selEnd);
+    const matched = tokenMap.filter(entry => {
+      if (entry.row < start.row || entry.row > end.row) return false;
+      if (entry.row === start.row && entry.col_end <= start.col) return false;
+      if (entry.row === end.row && entry.col_start >= end.col) return false;
+      return true;
+    });
+    const id = nextId++;
+    setSelections([{
+      id,
+      label: activeLabel,
+      text: selectedText,
+      polys: matched.map(e => e.poly),
+      tokenIds: matched.map(e => e.id),
+      edited: false,
+    }]);
+    setEditTexts(prev => ({ ...prev, [id]: selectedText }));
   }
 
-  function handleMouseDown(e: React.MouseEvent) {
-    if (!activeLabel || e.button !== 0) return;
-    e.preventDefault();
-    const { x, y } = getRelativePos(e);
-    setDraw({ startX: x, startY: y, currentX: x, currentY: y, active: true });
+  function handlePolyClick(entry: TokenMapEntry) {
+    if (!activeLabel) return;
+    const id = nextId++;
+    setSelections([{
+      id,
+      label: activeLabel,
+      text: entry.text,
+      polys: [entry.poly],
+      tokenIds: [entry.id],
+      edited: false,
+    }]);
+    setEditTexts(prev => ({ ...prev, [id]: entry.text }));
   }
 
-  function handleMouseMove(e: React.MouseEvent) {
-    if (!draw?.active) return;
-    const { x, y } = getRelativePos(e);
-    setDraw((d) => d ? { ...d, currentX: x, currentY: y } : d);
-  }
-
-  async function handleMouseUp(e: React.MouseEvent) {
-    if (e.button !== 0) return;
-    if (!draw?.active || !activeLabel || !imgRef.current) { setDraw(null); return; }
-    const { x, y } = getRelativePos(e);
-
-    const rectX = Math.min(draw.startX, x);
-    const rectY = Math.min(draw.startY, y);
-    const rectW = Math.abs(x - draw.startX);
-    const rectH = Math.abs(y - draw.startY);
-
-    if (rectW < 5 || rectH < 5) { setDraw(null); return; }
-
-    const img = imgRef.current;
-    const imgRect = img.getBoundingClientRect();
-    const containerRect = containerRef.current!.getBoundingClientRect();
-    const imgOffsetX = imgRect.left - containerRect.left;
-    const imgOffsetY = imgRect.top - containerRect.top;
-
-    const naturalAspect = img.naturalWidth / img.naturalHeight;
-    const containerAspect = imgRect.width / imgRect.height;
-    let renderedW: number, renderedH: number;
-    if (naturalAspect > containerAspect) {
-      renderedW = imgRect.width;
-      renderedH = imgRect.width / naturalAspect;
-    } else {
-      renderedH = imgRect.height;
-      renderedW = imgRect.height * naturalAspect;
-    }
-    const letterboxX = (imgRect.width - renderedW) / 2;
-    const letterboxY = (imgRect.height - renderedH) / 2;
-    const scaleX = img.naturalWidth / renderedW;
-    const scaleY = img.naturalHeight / renderedH;
-
-    const srcX = Math.round((rectX - imgOffsetX - letterboxX) * scaleX);
-    const srcY = Math.round((rectY - imgOffsetY - letterboxY) * scaleY);
-    const srcW = Math.round(rectW * scaleX);
-    const srcH = Math.round(rectH * scaleY);
-
-    const canvas = document.createElement("canvas");
-    canvas.width = srcW;
-    canvas.height = srcH;
-    const ctx = canvas.getContext("2d")!;
-    ctx.drawImage(img, srcX, srcY, srcW, srcH, 0, 0, srcW, srcH);
-
-    const dataUrl = canvas.toDataURL("image/png");
-
-    const poly = {
-      tl: [srcX,        srcY       ] as [number,number],
-      tr: [srcX + srcW, srcY       ] as [number,number],
-      br: [srcX + srcW, srcY + srcH] as [number,number],
-      bl: [srcX,        srcY + srcH] as [number,number],
-    };
-
-    const filename = `${activeLabel.toLowerCase()}_${Date.now()}.png`;
-
-    const blob = await (await fetch(dataUrl)).blob();
-    const form = new FormData();
-    form.append("crop", blob, filename);
-    form.append("filename", filename);
-    form.append("meta", JSON.stringify({ label: activeLabel, poly, srcRect: { x: srcX, y: srcY, w: srcW, h: srcH } }));
-    await fetch("/api/crop/save", { method: "POST", body: form });
-
-    setCropPreviews((prev) => [...prev, { label: activeLabel, dataUrl, filename, srcRect: { x: srcX, y: srcY, w: srcW, h: srcH }, poly, displayRect: { left: rectX, top: rectY, width: rectW, height: rectH } }]);
-    setDraw(null);
-    setActiveLabel(null);
-  }
-
-  async function handleCompare(index: number) {
-    if (!originalOcr) { setError("Please click 'Process Receipt' first before comparing."); return; }
-    const crop = cropPreviews[index];
-    setCropPreviews((prev) => prev.map((c, i) => i === index ? { ...c, comparing: true } : c));
-
-    const blob = await (await fetch(crop.dataUrl)).blob();
-    const form = new FormData();
-    form.append("crop_image", blob, crop.filename);
-    form.append("crop_meta", JSON.stringify({ label: crop.label, srcRect: crop.srcRect, poly: crop.poly }));
-    form.append("original_ocr", JSON.stringify(originalOcr));
+  async function handleUpdate(s: Selection) {
+    if (!ocrData) return;
+    const newText = editTexts[s.id] ?? s.text;
 
     try {
-      const res = await fetch("/api/compare", { method: "POST", body: form });
+      const res = await fetch("/api/update-ocr", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ocr_data: ocrData,
+          updates: [{ tokenIds: s.tokenIds, newText }],
+        }),
+      });
       const data = await res.json();
-      setCropPreviews((prev) => prev.map((c, i) => i === index ? { ...c, comparing: false, compareResult: res.ok ? data : null } : c));
-      if (!res.ok) setError(data.error ?? "Compare failed.");
+      if (!res.ok) { setError(data.error ?? "Update failed"); return; }
+
+      const newOcrData = data.ocr_data;
+      setOcrData(newOcrData);
+
+      const { layoutText: newLayout, tokenMap: newTokenMap } = reconstructLayoutText(
+        newOcrData.rec_texts,
+        newOcrData.rec_polys ?? ocrData.rec_polys,
+        ocrData.image_width,
+        ocrData.image_height
+      );
+      setLayoutText(newLayout);
+      setTokenMap(newTokenMap);
+
+      setSelections(prev => prev.map(sel =>
+        sel.id === s.id ? { ...sel, text: newText, edited: true } : sel
+      ));
     } catch (e) {
-      setCropPreviews((prev) => prev.map((c, i) => i === index ? { ...c, comparing: false } : c));
-      setError(`Compare failed: ${e}`);
+      setError(`Update request failed: ${e}`);
     }
   }
 
-  async function handleCancel(index: number) {
-    const crop = cropPreviews[index];
-    await fetch("/api/crop/delete", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filename: crop.filename }) });
-    setCropPreviews((prev) => prev.filter((_, i) => i !== index));
+  function removeSelection(id: number) {
+    setSelections(prev => prev.filter(s => s.id !== id));
+    setEditTexts(prev => { const n = { ...prev }; delete n[id]; return n; });
   }
 
   function handleSave() {
@@ -198,20 +175,36 @@ export default function Home() {
     const blob = new Blob([layoutText], { type: "text/plain" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url;
-    a.download = "reconstructed_layout.txt";
-    a.click();
+    a.href = url; a.download = "reconstructed_layout.txt"; a.click();
     URL.revokeObjectURL(url);
   }
 
-  const selectionRect = draw
-    ? {
-        left: Math.min(draw.startX, draw.currentX),
-        top: Math.min(draw.startY, draw.currentY),
-        width: Math.abs(draw.currentX - draw.startX),
-        height: Math.abs(draw.currentY - draw.startY),
-      }
-    : null;
+  function handleSaveJson() {
+    if (!selections.length) { setError("No selections to save."); return; }
+    const grouped: Record<LabelType, { text: string; polys: TokenMapEntry["poly"][] }[]> = { Date: [], Description: [], Amount: [] };
+    for (const s of selections) grouped[s.label].push({ text: editTexts[s.id] ?? s.text, polys: s.polys });
+    const blob = new Blob([JSON.stringify(grouped, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "tagged_selections.json"; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const labelColors: Record<LabelType, string> = {
+    Date: "#0070f3",
+    Description: "#7c3aed",
+    Amount: "#059669",
+  };
+
+  function selectionColorForPoly(poly: TokenMapEntry["poly"]): string | null {
+    const key = JSON.stringify(poly);
+    for (const s of selections) {
+      if (s.polys.some(p => JSON.stringify(p) === key)) return labelColors[s.label];
+    }
+    return null;
+  }
+
+  const showOverlay = preview && imgNatural && imgRendered && tokenMap.length > 0;
 
   return (
     <main style={styles.main}>
@@ -225,73 +218,54 @@ export default function Home() {
         </button>
 
         {preview && (
-          <div>
-            <p style={styles.hint}>
-              {activeLabel
-                ? `✏️ Now draw a box on the receipt to crop the "${activeLabel}" region`
-                : "Select a label then draw a box on the receipt:"}
-            </p>
-            <div style={styles.labelBtns}>
-              {LABELS.map((label) => (
-                <button
-                  key={label}
-                  onClick={() => setActiveLabel(activeLabel === label ? null : label)}
-                  style={{
-                    ...styles.labelBtn,
-                    background: LABEL_COLORS[label],
-                    outline: activeLabel === label ? "3px solid #000" : "none",
-                    outlineOffset: 2,
-                  }}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-
-            <div
-              ref={containerRef}
-              style={{ ...styles.imgContainer, cursor: activeLabel ? "crosshair" : "default" }}
-              onMouseDown={handleMouseDown}
-              onMouseMove={handleMouseMove}
-              onMouseUp={handleMouseUp}
-              onMouseLeave={() => { if (draw?.active) setDraw(null); }}
-              onContextMenu={(e) => e.preventDefault()}
-            >
-              <img
-                ref={imgRef}
-                src={preview}
-                alt="Receipt preview"
-                style={styles.preview}
-                draggable={false}
-              />
-              {/* persistent bbox overlays */}
-              {cropPreviews.map((c, i) => (
-                <div key={i} style={{
-                  position: "absolute",
-                  left: c.displayRect.left, top: c.displayRect.top,
-                  width: c.displayRect.width, height: c.displayRect.height,
-                  border: `2px solid ${LABEL_COLORS[c.label]}`,
-                  boxSizing: "border-box",
-                  pointerEvents: "none",
-                }}>
-                  <span style={{ position: "absolute", top: -20, left: 0, background: LABEL_COLORS[c.label], color: "#fff", fontSize: "0.7rem", fontWeight: 700, padding: "1px 6px", borderRadius: 4, pointerEvents: "auto", cursor: "pointer", userSelect: "none" }}
-                    onClick={() => handleCancel(i)}
-                  >✕ {c.label}</span>
-                </div>
-              ))}
-
-              {selectionRect && (
-                <div
-                  style={{
-                    position: "absolute",
-                    border: `2px solid ${activeLabel ? LABEL_COLORS[activeLabel] : "#000"}`,
-                    background: activeLabel ? `${LABEL_COLORS[activeLabel]}22` : "transparent",
-                    pointerEvents: "none",
-                    ...selectionRect,
-                  }}
-                />
-              )}
-            </div>
+          <div style={styles.imgWrapper}>
+            <img
+              ref={imgRef}
+              src={preview}
+              alt="Receipt preview"
+              style={styles.preview}
+              onLoad={() => {
+                if (imgRef.current) {
+                  setImgNatural({ w: imgRef.current.naturalWidth, h: imgRef.current.naturalHeight });
+                  setImgRendered({ w: imgRef.current.clientWidth, h: imgRef.current.clientHeight });
+                }
+              }}
+            />
+            {showOverlay && (
+              <svg
+                style={styles.svgOverlay}
+                width={imgRendered!.w}
+                height={imgRendered!.h}
+                viewBox={`0 0 ${imgRendered!.w} ${imgRendered!.h}`}
+              >
+                {tokenMap.map(entry => {
+                  const scaled = scalePolys([entry.poly], imgNatural!, imgRendered!)[0];
+                  const pts = scaled.map(([x, y]) => `${x},${y}`).join(" ");
+                  const selColor = selectionColorForPoly(entry.poly);
+                  const isHovered = hoveredId === entry.id;
+                  const fill = selColor
+                    ? selColor + "33"
+                    : isHovered
+                    ? (activeLabel ? labelColors[activeLabel] + "44" : "#00000022")
+                    : "transparent";
+                  const stroke = selColor ?? (isHovered ? (activeLabel ? labelColors[activeLabel] : "#555") : "#aaaaaa88");
+                  const strokeW = selColor || isHovered ? 2 : 1;
+                  return (
+                    <polygon
+                      key={entry.id}
+                      points={pts}
+                      fill={fill}
+                      stroke={stroke}
+                      strokeWidth={strokeW}
+                      style={{ cursor: activeLabel ? "pointer" : "default", transition: "fill 0.1s" }}
+                      onMouseEnter={() => setHoveredId(entry.id)}
+                      onMouseLeave={() => setHoveredId(null)}
+                      onClick={() => handlePolyClick(entry)}
+                    />
+                  );
+                })}
+              </svg>
+            )}
           </div>
         )}
 
@@ -300,49 +274,40 @@ export default function Home() {
         </button>
       </div>
 
-      {cropPreviews.length > 0 && (
-        <div style={styles.card}>
-          <label style={styles.label}>Cropped Regions</label>
-          <div style={styles.cropGrid}>
-            {cropPreviews.map((c, i) => (
-              <div key={i} style={styles.cropItem}>
-                <span style={{ ...styles.cropTag, background: LABEL_COLORS[c.label] }}>{c.label}</span>
-                <img src={c.dataUrl} alt={c.label} style={styles.cropImg} />
-                <div style={styles.cropCoords}>
-                  {([['tl','top-left'],['tr','top-right'],['br','bottom-right'],['bl','bottom-left']] as const).map(([key, name]) => (
-                    <div key={key}><span style={styles.coordPoint}>[{c.poly[key][0]}, {c.poly[key][1]}]</span> {name}</div>
-                  ))}
-                </div>
-                <button
-                  style={{ ...styles.btn, background: "#f59e0b", color: "#fff", fontSize: "0.8rem", padding: "0.4rem 0.9rem" }}
-                  onClick={() => handleCompare(i)}
-                  disabled={c.comparing}
-                >
-                  {c.comparing ? "Comparing…" : "Compare"}
-                </button>
-                {c.compareResult && (
-                  <div style={{ ...styles.cropCoords, background: c.compareResult.match ? "#d1fae5" : "#fee2e2" }}>
-                    <div><strong>Crop text:</strong> {c.compareResult.crop_text || "—"}</div>
-                    <div><strong>Original text:</strong> {c.compareResult.original_text || "—"}</div>
-                    <div><strong>Similarity:</strong> {(c.compareResult.similarity * 100).toFixed(0)}%</div>
-                    <div><strong>Match:</strong> {c.compareResult.match ? "✅ Yes" : "❌ No"}</div>
-                    <div><strong>Crop confidence:</strong> {c.compareResult.crop_confidence != null ? `${(c.compareResult.crop_confidence * 100).toFixed(1)}%` : "—"}</div>
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
       {error && <p style={styles.error}>{error}</p>}
+
+      {ocrData && (
+        <details style={{ marginBottom: "1rem", fontSize: "0.75rem", color: "#555" }}>
+          <summary>OCR State (debug)</summary>
+          <pre style={{ maxHeight: 300, overflow: "auto", background: "#f5f5f5", padding: "0.5rem", borderRadius: 4, border: "1px solid #ddd" }}>
+{JSON.stringify(ocrData.rec_texts, null, 2)}
+          </pre>
+        </details>
+      )}
 
       {layoutText !== "" && (
         <div style={styles.card}>
-          <label style={styles.label}>Reconstructed Layout Text (editable)</label>
+          <label style={styles.label}>Reconstructed Layout Text</label>
+          {tokenMap.length > 0 && (
+            <div style={styles.labelRow}>
+              <span style={styles.labelHint}>Tag selection as:</span>
+              {(["Date", "Description", "Amount"] as LabelType[]).map(l => (
+                <button
+                  key={l}
+                  style={{ ...styles.labelBtn, borderColor: labelColors[l], color: activeLabel === l ? "#fff" : labelColors[l], background: activeLabel === l ? labelColors[l] : "transparent" }}
+                  onClick={() => setActiveLabel(prev => prev === l ? null : l)}
+                >
+                  {l}
+                </button>
+              ))}
+              {activeLabel && <span style={styles.activeLabelHint}>Select text below or click a box on the image → tagged as <strong>{activeLabel}</strong></span>}
+            </div>
+          )}
           <textarea
+            ref={textareaRef}
             value={layoutText}
-            onChange={(e) => setLayoutText(e.target.value)}
+            onChange={e => setLayoutText(e.target.value)}
+            onMouseUp={handleTextareaMouseUp}
             style={styles.textarea}
             rows={25}
             spellCheck={false}
@@ -352,31 +317,90 @@ export default function Home() {
           </button>
         </div>
       )}
+
+      {selections.length > 0 && (
+        <div style={styles.card}>
+          <label style={styles.label}>Tagged Selections</label>
+          <div style={styles.selectionList}>
+            {selections.map(s => (
+              <div key={s.id} style={{ ...styles.selCard, borderLeftColor: labelColors[s.label] }}>
+                <div style={styles.selHeader}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+                    <span style={{ ...styles.selLabel, background: labelColors[s.label] }}>{s.label}</span>
+                    {s.edited && <span style={styles.editedBadge}>✏ edited</span>}
+                  </div>
+                  <button style={styles.removeBtn} onClick={() => removeSelection(s.id)}>✕</button>
+                </div>
+
+                <textarea
+                  style={{ ...styles.editInput, resize: "vertical", minHeight: 120 }}
+                  value={editTexts[s.id] ?? s.text}
+                  onChange={e => setEditTexts(prev => ({ ...prev, [s.id]: e.target.value }))}
+                  rows={6}
+                />
+
+                {s.polys.length > 0 ? (
+                  <div style={styles.polyBlock}>
+                    {s.polys.map((poly, pi) => (
+                      <div key={pi} style={styles.polyRow}>
+                        <span style={styles.polyIndex}>#{pi + 1}</span>
+                        <span style={styles.polyCoords}>
+                          {poly.map(([x, y]) => `(${Math.round(x)}, ${Math.round(y)})`).join("  ")}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p style={styles.selMeta}>No polygons matched</p>
+                )}
+
+                <button
+                  style={{ ...styles.btn, ...styles.secondary, fontSize: "0.8rem", padding: "0.3rem 0.8rem" }}
+                  onClick={() => handleUpdate(s)}
+                >
+                  Update
+                </button>
+              </div>
+            ))}
+          </div>
+          <button style={{ ...styles.btn, ...styles.primary }} onClick={handleSaveJson}>
+            Save JSON
+          </button>
+        </div>
+      )}
     </main>
   );
 }
 
 const styles: Record<string, React.CSSProperties> = {
-  main: { maxWidth: 800, margin: "0 auto", padding: "2rem 1rem" },
-  h1: { fontSize: "1.6rem", marginBottom: "0.25rem" },
-  sub: { color: "#555", marginBottom: "1.5rem" },
-  card: { background: "#fff", borderRadius: 8, padding: "1.5rem", marginBottom: "1.5rem", boxShadow: "0 1px 4px rgba(0,0,0,0.1)", display: "flex", flexDirection: "column", gap: "1rem" },
-  uploadBtn: { padding: "0.6rem 1.2rem", borderRadius: 6, border: "2px dashed #aaa", background: "#fafafa", cursor: "pointer", fontSize: "0.95rem", textAlign: "left" },
-  hint: { fontSize: "0.85rem", color: "#555", margin: "0 0 0.5rem" },
-  labelBtns: { display: "flex", gap: "0.75rem", marginBottom: "0.75rem" },
-  labelBtn: { padding: "0.45rem 1rem", borderRadius: 20, color: "#fff", fontWeight: 700, fontSize: "0.85rem", cursor: "pointer", border: "none" },
-  imgContainer: { position: "relative", display: "inline-block", width: "100%" },
-  preview: { width: "100%", maxHeight: 500, objectFit: "contain", borderRadius: 6, display: "block", userSelect: "none" },
-  btn: { padding: "0.6rem 1.4rem", borderRadius: 6, border: "none", cursor: "pointer", fontSize: "0.95rem", fontWeight: 600, alignSelf: "flex-start" },
-  primary: { background: "#0070f3", color: "#fff" },
-  secondary: { background: "#e5e7eb", color: "#111" },
-  error: { color: "#c00", background: "#fff0f0", padding: "0.75rem 1rem", borderRadius: 6, border: "1px solid #fcc" },
-  label: { fontWeight: 600, fontSize: "0.9rem", color: "#333" },
-  textarea: { fontFamily: "monospace", whiteSpace: "pre", overflowX: "auto", fontSize: "0.82rem", padding: "0.75rem", borderRadius: 6, border: "1px solid #ddd", resize: "vertical", background: "#fafafa" },
-  cropGrid: { display: "flex", flexWrap: "wrap", gap: "1rem" },
-  cropItem: { display: "flex", flexDirection: "column", gap: "0.3rem" },
-  cropTag: { display: "inline-block", padding: "0.2rem 0.6rem", borderRadius: 12, color: "#fff", fontSize: "0.75rem", fontWeight: 700, alignSelf: "flex-start" },
-  cropImg: { border: "1px solid #ddd", borderRadius: 4, maxWidth: 260 },
-  cropCoords: { fontSize: "0.75rem", color: "#374151", fontFamily: "monospace", background: "#f3f4f6", padding: "6px 10px", borderRadius: 4, display: "flex", flexDirection: "column", gap: 2 },
-  coordPoint: { display: "inline-block", minWidth: 100, color: "#0070f3", fontWeight: 600 },
+  main:            { maxWidth: 800, margin: "0 auto", padding: "2rem 1rem" },
+  h1:              { fontSize: "1.6rem", marginBottom: "0.25rem" },
+  sub:             { color: "#555", marginBottom: "1.5rem" },
+  card:            { background: "#fff", borderRadius: 8, padding: "1.5rem", marginBottom: "1.5rem", boxShadow: "0 1px 4px rgba(0,0,0,0.1)", display: "flex", flexDirection: "column", gap: "1rem" },
+  uploadBtn:       { padding: "0.6rem 1.2rem", borderRadius: 6, border: "2px dashed #aaa", background: "#fafafa", cursor: "pointer", fontSize: "0.95rem", textAlign: "left" },
+  imgWrapper:      { position: "relative", display: "inline-block", width: "100%" },
+  preview:         { width: "100%", maxHeight: 500, objectFit: "contain", borderRadius: 6, display: "block" },
+  svgOverlay:      { position: "absolute", top: 0, left: 0, pointerEvents: "auto" },
+  btn:             { padding: "0.6rem 1.4rem", borderRadius: 6, border: "none", cursor: "pointer", fontSize: "0.95rem", fontWeight: 600, alignSelf: "flex-start" },
+  primary:         { background: "#0070f3", color: "#fff" },
+  secondary:       { background: "#e5e7eb", color: "#111" },
+  error:           { color: "#c00", background: "#fff0f0", padding: "0.75rem 1rem", borderRadius: 6, border: "1px solid #fcc" },
+  label:           { fontWeight: 600, fontSize: "0.9rem", color: "#333" },
+  textarea:        { fontFamily: "monospace", whiteSpace: "pre", overflowX: "auto", fontSize: "0.82rem", padding: "0.75rem", borderRadius: 6, border: "1px solid #ddd", resize: "vertical", background: "#fafafa" },
+  labelRow:        { display: "flex", alignItems: "center", gap: "0.5rem", flexWrap: "wrap" },
+  labelHint:       { fontSize: "0.85rem", color: "#555" },
+  labelBtn:        { padding: "0.3rem 0.9rem", borderRadius: 20, border: "2px solid", cursor: "pointer", fontSize: "0.85rem", fontWeight: 600, transition: "all 0.15s" },
+  activeLabelHint: { fontSize: "0.8rem", color: "#555", marginLeft: "0.5rem" },
+  selectionList:   { display: "flex", flexDirection: "column", gap: "0.75rem" },
+  selCard:         { borderLeft: "4px solid", borderRadius: 6, padding: "0.75rem 1rem", background: "#f9fafb", display: "flex", flexDirection: "column", gap: "0.5rem" },
+  selHeader:       { display: "flex", justifyContent: "space-between", alignItems: "center" },
+  selLabel:        { color: "#fff", fontSize: "0.75rem", fontWeight: 700, padding: "0.15rem 0.6rem", borderRadius: 12 },
+  editedBadge:     { fontSize: "0.72rem", color: "#92400e", background: "#fef3c7", padding: "0.1rem 0.5rem", borderRadius: 10, fontWeight: 600 },
+  removeBtn:       { background: "none", border: "none", cursor: "pointer", fontSize: "1rem", color: "#888", lineHeight: 1 },
+  editInput:       { fontFamily: "monospace", fontSize: "0.88rem", padding: "0.4rem 0.6rem", borderRadius: 6, border: "1px solid #ddd", background: "#fff", width: "100%", boxSizing: "border-box", whiteSpace: "pre-wrap", overflowWrap: "break-word" },
+  selMeta:         { margin: 0, fontSize: "0.78rem", color: "#666" },
+  polyBlock:       { display: "flex", flexDirection: "column", gap: "0.25rem" },
+  polyRow:         { display: "flex", alignItems: "baseline", gap: "0.5rem" },
+  polyIndex:       { fontSize: "0.72rem", fontWeight: 700, color: "#888", minWidth: 24 },
+  polyCoords:      { fontSize: "0.75rem", fontFamily: "monospace", color: "#444", wordBreak: "break-all" },
 };

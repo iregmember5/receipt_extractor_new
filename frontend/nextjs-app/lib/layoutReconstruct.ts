@@ -8,11 +8,22 @@ interface Item {
   x_max: number;
   y_min: number;
   y_max: number;
+  poly: Poly;
+  origIndex: number;
 }
 
 interface Row {
   y_center: number;
   items: Item[];
+}
+
+export interface TokenMapEntry {
+  id: number;
+  text: string;
+  row: number;
+  col_start: number;
+  col_end: number;
+  poly: Poly;
 }
 
 function median(values: number[]): number {
@@ -80,16 +91,16 @@ export function reconstructLayoutText(
   recPolys: Poly[],
   imgWidth: number,
   imgHeight: number
-): string {
+): { layoutText: string; tokenMap: TokenMapEntry[] } {
   const items: Item[] = [];
   for (let i = 0; i < recTexts.length; i++) {
     const text = recTexts[i];
     if (!text || i >= recPolys.length || recPolys[i].length < 4) continue;
     const { xc, yc, xmin, ymin, xmax, ymax } = getBoxCenter(recPolys[i]);
-    items.push({ text, x_center: xc, y_center: yc, x_min: xmin, x_max: xmax, y_min: ymin, y_max: ymax });
+    items.push({ text, x_center: xc, y_center: yc, x_min: xmin, x_max: xmax, y_min: ymin, y_max: ymax, poly: recPolys[i], origIndex: i });
   }
 
-  if (!items.length) return "";
+  if (!items.length) return { layoutText: "", tokenMap: [] };
 
   snapXminToColumns(items, imgWidth);
   const rows = groupIntoRows(items);
@@ -122,12 +133,17 @@ export function reconstructLayoutText(
   }
 
   const outLines: string[] = [];
+  const tokenMap: TokenMapEntry[] = [];
   let prevY: number | null = null;
+  let rowIndex = 0;
 
   for (const row of rows) {
     if (prevY !== null) {
       const gapLines = Math.round((row.y_center - prevY) / lineHeight) - 1;
-      for (let g = 0; g < Math.max(0, gapLines); g++) outLines.push("");
+      for (let g = 0; g < Math.max(0, gapLines); g++) {
+        outLines.push("");
+        rowIndex++;
+      }
     }
     prevY = row.y_center;
 
@@ -140,12 +156,23 @@ export function reconstructLayoutText(
       const needed = start + item.text.length + 2;
       while (line.length < needed) line.push(" ");
       for (let j = 0; j < item.text.length; j++) line[start + j] = item.text[j];
+
+      tokenMap.push({
+        id: item.origIndex,
+        text: item.text,
+        row: rowIndex,
+        col_start: start,
+        col_end: start + item.text.length,
+        poly: item.poly,
+      });
+
       cursor = start + item.text.length + 1;
     }
 
     outLines.push(line.join("").trimEnd());
     outputWidth = Math.max(outputWidth, line.length);
+    rowIndex++;
   }
 
-  return outLines.join("\n");
+  return { layoutText: outLines.join("\n"), tokenMap };
 }

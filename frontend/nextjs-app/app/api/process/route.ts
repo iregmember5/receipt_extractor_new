@@ -27,12 +27,22 @@ export async function POST(req: NextRequest) {
   const { ocr_data, image_width, image_height } = data;
   if (!ocr_data) return NextResponse.json({ error: "No ocr_data in response." }, { status: 500 });
 
-  const layoutText = reconstructLayoutText(
+  const { layoutText, tokenMap } = reconstructLayoutText(
     ocr_data.rec_texts ?? [],
     ocr_data.rec_polys ?? [],
     image_width,
     image_height
   );
 
-  return NextResponse.json({ layoutText, originalOcr: { rec_texts: ocr_data.rec_texts, rec_polys: ocr_data.rec_polys, rec_scores: ocr_data.rec_scores } });
+  return NextResponse.json({
+    layoutText,
+    tokenMap,
+    ocrData: {
+      rec_texts: ocr_data.rec_texts,
+      rec_polys: ocr_data.rec_polys,
+      rec_scores: ocr_data.rec_scores,
+      image_width,
+      image_height,
+    },
+  });
 }

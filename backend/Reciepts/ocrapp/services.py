@@ -108,6 +108,24 @@ def build_layout_text(rows, image_width=520, output_width=90):
     return "\n".join(lines)
 
 
+def update_ocr_texts(ocr_data, updates):
+    """
+    Given ocr_data (dict with rec_texts, rec_polys, rec_scores) and a list of
+    updates [{ tokenIds: [int, ...], newText: string }], return a new ocr_data
+    dict with rec_texts patched.
+
+    For each update: the first tokenId gets newText, subsequent tokenIds get "".
+    """
+    new_rec_texts = list(ocr_data["rec_texts"])
+    for upd in updates:
+        token_ids = upd["tokenIds"]
+        new_text = upd["newText"]
+        for i, tid in enumerate(token_ids):
+            if 0 <= tid < len(new_rec_texts):
+                new_rec_texts[tid] = new_text if i == 0 else ""
+    return {**ocr_data, "rec_texts": new_rec_texts}
+
+
 def normalize_ocr_result(result):
     candidates = []
 
@@ -163,73 +181,6 @@ def extract_items_from_json_data(data, score_threshold=0.70):
         })
 
     return items
-
-
-def ocr_image(image_path: Path) -> dict:
-    """Run OCR on any image and return raw filtered json_data dict."""
-    ocr = get_ocr_engine()
-    results = ocr.predict(str(image_path))
-
-    rec_texts, rec_scores, rec_polys = [], [], []
-    for result in results:
-        result_dict = normalize_ocr_result(result)
-        rec_texts.extend(result_dict.get("rec_texts", []))
-        rec_scores.extend(result_dict.get("rec_scores", []))
-        polys = result_dict.get("rec_polys") or result_dict.get("dt_polys", [])
-        rec_polys.extend(polys)
-
-    score_threshold = 0.70
-    filtered_texts, filtered_scores, filtered_polys = [], [], []
-    for i, score in enumerate(rec_scores):
-        if score >= score_threshold:
-            filtered_texts.append(rec_texts[i] if i < len(rec_texts) else "")
-            filtered_scores.append(score)
-            filtered_polys.append(rec_polys[i] if i < len(rec_polys) else [])
-
-    return {"rec_texts": filtered_texts, "rec_scores": filtered_scores, "rec_polys": filtered_polys}
-
-
-def find_texts_in_region(original_ocr: dict, src_rect: dict) -> list[str]:
-    """Return all rec_texts whose center falls inside src_rect {x,y,w,h}."""
-    x, y, w, h = src_rect["x"], src_rect["y"], src_rect["w"], src_rect["h"]
-    texts = original_ocr.get("rec_texts", [])
-    polys = original_ocr.get("rec_polys", [])
-    matched = []
-    for i, poly in enumerate(polys):
-        if i >= len(texts) or not poly:
-            continue
-        box = get_box_info(poly)
-        if x <= box["x_center"] <= x + w and y <= box["y_center"] <= y + h:
-            t = clean_text(texts[i])
-            if t:
-                matched.append(t)
-    return matched
-
-
-def normalize_text(text: str) -> str:
-    return re.sub(r"\s+", "", text).lower()
-
-
-def compare_texts(crop_texts: list[str], original_texts: list[str]) -> dict:
-    """Compare crop OCR texts against original region texts."""
-    crop_joined = " ".join(crop_texts)
-    original_joined = " ".join(original_texts)
-    crop_norm = normalize_text(crop_joined)
-    original_norm = normalize_text(original_joined)
-
-    if not crop_norm or not original_norm:
-        similarity = 0.0
-    else:
-        # character-level overlap ratio
-        matches = sum(c in original_norm for c in crop_norm)
-        similarity = round(matches / max(len(crop_norm), len(original_norm)), 2)
-
-    return {
-        "crop_text": crop_joined,
-        "original_text": original_joined,
-        "match": similarity >= 0.8,
-        "similarity": similarity,
-    }
 
 
 def run_receipt_pipeline(image_path: Path, work_dir: Path):

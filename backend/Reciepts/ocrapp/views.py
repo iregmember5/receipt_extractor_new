@@ -9,7 +9,7 @@ from django.shortcuts import render
 from django.views.decorators.csrf import csrf_exempt
 from PIL import Image
 
-from .services import run_receipt_pipeline, ocr_image, find_texts_in_region, compare_texts, ocr_image, find_texts_in_region, compare_texts
+from .services import run_receipt_pipeline, update_ocr_texts
 
 
 def _get_image_size(uploaded):
@@ -95,6 +95,30 @@ def process_receipt_api_view(request):
 
 
 @csrf_exempt
+def update_ocr_view(request):
+    if request.method != "POST":
+        return JsonResponse({"error": "Only POST method is allowed."}, status=405)
+
+    try:
+        body = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON body."}, status=400)
+
+    ocr_data = body.get("ocr_data")
+    updates = body.get("updates", [])
+
+    if not ocr_data or not updates:
+        return JsonResponse({"error": "ocr_data and updates are required."}, status=400)
+
+    if "rec_texts" not in ocr_data or "rec_polys" not in ocr_data:
+        return JsonResponse({"error": "ocr_data must contain rec_texts and rec_polys."}, status=400)
+
+    new_ocr_data = update_ocr_texts(ocr_data, updates)
+
+    return JsonResponse({"ocr_data": new_ocr_data})
+
+
+@csrf_exempt
 def process_receipt_json_view(request):
 	if request.method != "POST":
 		return JsonResponse({"error": "Only POST method is allowed."}, status=405)
@@ -121,46 +145,3 @@ def process_receipt_json_view(request):
 			"ocr_data": ocr_data,
 		}
 	)
-
-
-@csrf_exempt
-def compare_crop_view(request):
-	if request.method != "POST":
-		return JsonResponse({"error": "Only POST method is allowed."}, status=405)
-
-	crop_image = request.FILES.get("crop_image")
-	crop_meta_str = request.POST.get("crop_meta")
-	original_ocr_str = request.POST.get("original_ocr")
-
-	if not crop_image or not crop_meta_str or not original_ocr_str:
-		return JsonResponse({"error": "crop_image, crop_meta and original_ocr are required."}, status=400)
-
-	try:
-		crop_meta = json.loads(crop_meta_str)
-		original_ocr = json.loads(original_ocr_str)
-		src_rect = crop_meta["srcRect"]
-
-		upload_dir = Path(settings.MEDIA_ROOT) / "uploads"
-		upload_dir.mkdir(parents=True, exist_ok=True)
-		crop_path = upload_dir / f"crop_{uuid4().hex}.png"
-		with open(crop_path, "wb") as f:
-			for chunk in crop_image.chunks():
-				f.write(chunk)
-
-		crop_ocr = ocr_image(crop_path)
-		crop_texts = crop_ocr.get("rec_texts", [])
-		crop_scores = crop_ocr.get("rec_scores", [])
-
-		original_texts = find_texts_in_region(original_ocr, src_rect)
-
-		result = compare_texts(crop_texts, original_texts)
-		result["label"] = crop_meta.get("label", "")
-		result["src_rect"] = src_rect
-		result["crop_confidence"] = round(sum(crop_scores) / len(crop_scores), 3) if crop_scores else None
-
-		crop_path.unlink(missing_ok=True)
-
-		return JsonResponse(result)
-
-	except Exception:
-		return JsonResponse({"error": f"Comparison failed:\n{traceback.format_exc()}"}, status=500)
