@@ -109,3 +109,9 @@ walid-khan@walid-khan-OptiPlex-7020:~/receipt_extractor_new$ cd frontend
 walid-khan@walid-khan-OptiPlex-7020:~/receipt_extractor_new/frontend$ python3 -m http.server 3000 --bind 0.0.0.0
 
 http://localhost:3000 
+
+
+
+
+
+ls -lt media/results/ | head -5   this command show fiver newest json files
