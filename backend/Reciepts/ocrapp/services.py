@@ -1,0 +1,305 @@
+
+import json
+import re
+from pathlib import Path
+
+from paddleocr import PaddleOCR
+
+
+# Reuse one OCR engine per process to avoid reloading models on each request.
+_OCR_ENGINE = None
+
+
+def get_ocr_engine() -> PaddleOCR:
+    global _OCR_ENGINE
+
+    if _OCR_ENGINE is None:
+        _OCR_ENGINE = PaddleOCR(
+            ocr_version="PP-OCRv5",
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            device="cpu",
+        )
+
+    return _OCR_ENGINE
+
+
+def clean_text(text: str) -> str:
+    text = text or ""
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def get_box_info(poly):
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+
+    x_min = min(xs)
+    x_max = max(xs)
+    y_min = min(ys)
+    y_max = max(ys)
+
+    return {
+        "x_min": x_min,
+        "x_max": x_max,
+        "y_min": y_min,
+        "y_max": y_max,
+        "x_center": (x_min + x_max) / 2,
+        "y_center": (y_min + y_max) / 2,
+        "height": y_max - y_min,
+        "width": x_max - x_min,
+    }
+
+
+def group_items_into_rows(items, y_tolerance=12):
+    items = sorted(items, key=lambda x: (x["y_center"], x["x_min"]))
+    rows = []
+
+    for item in items:
+        placed = False
+
+        for row in rows:
+            if abs(item["y_center"] - row["y_center"]) <= y_tolerance:
+                row["items"].append(item)
+                row["y_center"] = sum(x["y_center"] for x in row["items"]) / len(row["items"])
+                placed = True
+                break
+
+        if not placed:
+            rows.append({"y_center": item["y_center"], "items": [item]})
+
+    rows = sorted(rows, key=lambda r: r["y_center"])
+
+    for row in rows:
+        row["items"] = sorted(row["items"], key=lambda x: x["x_min"])
+
+    return rows
+
+
+def build_plain_text(rows):
+    lines = []
+
+    for row in rows:
+        lines.append(" ".join(item["text"] for item in row["items"]))
+
+    return "\n".join(lines)
+
+
+def build_layout_text(rows, image_width=520, output_width=90):
+    lines = []
+    scale = output_width / image_width
+
+    for row in rows:
+        line_chars = [" "] * output_width
+
+        for item in row["items"]:
+            start = int(item["x_min"] * scale)
+            start = max(0, min(start, output_width - 1))
+
+            for i, ch in enumerate(item["text"]):
+                pos = start + i
+                if pos >= output_width:
+                    break
+                line_chars[pos] = ch
+
+        lines.append("".join(line_chars).rstrip())
+
+    return "\n".join(lines)
+
+
+def normalize_ocr_result(result):
+    candidates = []
+
+    result_json = getattr(result, "json", None)
+    if isinstance(result_json, dict):
+        candidates.append(result_json)
+
+    if hasattr(result, "to_dict"):
+        candidates.append(result.to_dict())
+
+    if isinstance(result, dict):
+        candidates.append(dict(result))
+
+    for candidate in candidates:
+        data = candidate.get("res", candidate)
+        if isinstance(data, dict) and data.get("rec_texts"):
+            return data
+
+    return {}
+
+
+def extract_items_from_json_data(data, score_threshold=0.70):
+    texts = data.get("rec_texts", [])
+    scores = data.get("rec_scores", [])
+    polys = data.get("rec_polys") or data.get("dt_polys", [])
+
+    if not texts:
+        raise ValueError("No rec_texts found in OCR JSON output.")
+
+    if not polys:
+        raise ValueError("No rec_polys or dt_polys found in OCR JSON output.")
+
+    items = []
+
+    for i, text in enumerate(texts):
+        if i >= len(polys):
+            continue
+
+        score = scores[i] if i < len(scores) else None
+        if score is not None and score < score_threshold:
+            continue
+
+        text = clean_text(text)
+        if not text:
+            continue
+
+        box = get_box_info(polys[i])
+
+        items.append({
+            "text": text,
+            "score": score,
+            **box,
+        })
+
+    return items
+
+
+def ocr_image(image_path: Path) -> dict:
+    """Run OCR on any image and return raw filtered json_data dict."""
+    ocr = get_ocr_engine()
+    results = ocr.predict(str(image_path))
+
+    rec_texts, rec_scores, rec_polys = [], [], []
+    for result in results:
+        result_dict = normalize_ocr_result(result)
+        rec_texts.extend(result_dict.get("rec_texts", []))
+        rec_scores.extend(result_dict.get("rec_scores", []))
+        polys = result_dict.get("rec_polys") or result_dict.get("dt_polys", [])
+        rec_polys.extend(polys)
+
+    score_threshold = 0.70
+    filtered_texts, filtered_scores, filtered_polys = [], [], []
+    for i, score in enumerate(rec_scores):
+        if score >= score_threshold:
+            filtered_texts.append(rec_texts[i] if i < len(rec_texts) else "")
+            filtered_scores.append(score)
+            filtered_polys.append(rec_polys[i] if i < len(rec_polys) else [])
+
+    return {"rec_texts": filtered_texts, "rec_scores": filtered_scores, "rec_polys": filtered_polys}
+
+
+def find_texts_in_region(original_ocr: dict, src_rect: dict) -> list[str]:
+    """Return all rec_texts whose center falls inside src_rect {x,y,w,h}."""
+    x, y, w, h = src_rect["x"], src_rect["y"], src_rect["w"], src_rect["h"]
+    texts = original_ocr.get("rec_texts", [])
+    polys = original_ocr.get("rec_polys", [])
+    matched = []
+    for i, poly in enumerate(polys):
+        if i >= len(texts) or not poly:
+            continue
+        box = get_box_info(poly)
+        if x <= box["x_center"] <= x + w and y <= box["y_center"] <= y + h:
+            t = clean_text(texts[i])
+            if t:
+                matched.append(t)
+    return matched
+
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", "", text).lower()
+
+
+def compare_texts(crop_texts: list[str], original_texts: list[str]) -> dict:
+    """Compare crop OCR texts against original region texts."""
+    crop_joined = " ".join(crop_texts)
+    original_joined = " ".join(original_texts)
+    crop_norm = normalize_text(crop_joined)
+    original_norm = normalize_text(original_joined)
+
+    if not crop_norm or not original_norm:
+        similarity = 0.0
+    else:
+        # character-level overlap ratio
+        matches = sum(c in original_norm for c in crop_norm)
+        similarity = round(matches / max(len(crop_norm), len(original_norm)), 2)
+
+    return {
+        "crop_text": crop_joined,
+        "original_text": original_joined,
+        "match": similarity >= 0.8,
+        "similarity": similarity,
+    }
+
+
+def run_receipt_pipeline(image_path: Path, work_dir: Path):
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    ocr = get_ocr_engine()
+    results = ocr.predict(str(image_path))
+
+    rec_texts = []
+    rec_scores = []
+    rec_polys = []
+    rec_boxes = []
+    source_json = []
+
+    for result in results:
+        result_dict = normalize_ocr_result(result)
+        source_json.append(result_dict)
+
+        rec_texts.extend(result_dict.get("rec_texts", []))
+        rec_scores.extend(result_dict.get("rec_scores", []))
+
+        polys = result_dict.get("rec_polys") or result_dict.get("dt_polys", [])
+        rec_polys.extend(polys)
+        rec_boxes.extend(result_dict.get("rec_boxes", []))
+
+    score_threshold = 0.70
+
+    filtered_texts = []
+    filtered_scores = []
+    filtered_polys = []
+    filtered_boxes = []
+
+    for i, score in enumerate(rec_scores):
+        if score >= score_threshold:
+            filtered_texts.append(rec_texts[i] if i < len(rec_texts) else "")
+            filtered_scores.append(score)
+            filtered_polys.append(rec_polys[i] if i < len(rec_polys) else [])
+            filtered_boxes.append(rec_boxes[i] if i < len(rec_boxes) else [])
+
+    json_data = {
+        "rec_texts": filtered_texts,
+        "rec_scores": filtered_scores,
+        "rec_polys": filtered_polys,
+        "rec_boxes": filtered_boxes,
+        "source_results": source_json,
+    }
+
+    base_name = image_path.stem
+    json_path = work_dir / f"{base_name}_res.json"
+    ordered_text_path = work_dir / f"{base_name}_text_ordered.txt"
+    layout_text_path = work_dir / f"{base_name}_text_layout.txt"
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(json_data, f, ensure_ascii=False, indent=2)
+
+    items = extract_items_from_json_data(json_data, score_threshold=score_threshold)
+    rows = group_items_into_rows(items, y_tolerance=12)
+
+    plain_text = build_plain_text(rows)
+    image_width = max((item["x_max"] for item in items), default=520)
+    layout_text = build_layout_text(rows, image_width=image_width)
+
+    with open(ordered_text_path, "w", encoding="utf-8") as f:
+        f.write(plain_text)
+
+    with open(layout_text_path, "w", encoding="utf-8") as f:
+        f.write(layout_text)
+
+    return {
+        "json_path": json_path,
+        "ordered_text_path": ordered_text_path,
+        "layout_text_path": layout_text_path,
+    }

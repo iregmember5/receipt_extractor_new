@@ -1,0 +1,262 @@
+=============================================================
+PROJECT PROGRESS LOG — Receipt OCR Feature Extraction App
+=============================================================
+
+-----------------------------------------------------------
+1. NEXT.JS MIGRATION
+-----------------------------------------------------------
+- Migrated Gradio frontend (gradio_app.py) to Next.js 14
+- Location: frontend/nextjs-app/
+- Files created:
+    - app/page.tsx          → main UI
+    - app/layout.tsx        → root layout
+    - app/api/process/route.ts → proxies to Django
+    - lib/layoutReconstruct.ts → full TypeScript port of Python layout reconstruction logic
+
+-----------------------------------------------------------
+2. LABEL + CROP RECTANGLE FEATURE
+-----------------------------------------------------------
+- User selects a label button (Date / Description / Amount)
+- Draws a rectangle on the receipt image using mouse
+- Canvas API crops the exact region
+- Saves PNG + JSON (with polygon coords) to frontend/crop_images/ via POST /api/crop/save
+- Cancel (✕) deletes both files via DELETE /api/crop/delete
+- Right-click blocked via e.button !== 0 check
+- onMouseLeave cancels active draw
+
+-----------------------------------------------------------
+3. POLYGON COORDINATES
+-----------------------------------------------------------
+- Each crop saves a .json file alongside the .png
+- Format: { label, poly: {tl, tr, br, bl}, srcRect: {x, y, w, h} }
+- Coordinates shown in "Cropped Regions" section in 4-corner polygon format [x,y] corner-name
+
+-----------------------------------------------------------
+4. PERSISTENT BBOX OVERLAY
+-----------------------------------------------------------
+- Drawn rectangles persist on the image with colored border and ✕ Label tag
+- Clicking ✕ removes bbox, crop card, and deletes files from server
+- Each label has its own color:
+    Date        → purple  (#7c3aed)
+    Description → blue    (#0070f3)
+    Amount      → green   (#059669)
+
+-----------------------------------------------------------
+5. COMPARE FEATURE
+-----------------------------------------------------------
+- Backend endpoint: POST /api/compare-crop/
+- Runs OCR on the crop image
+- Finds matching texts in original OCR using srcRect (center-point containment)
+- Compares crop OCR texts vs original region texts
+- Frontend sends: crop image + crop meta + original OCR JSON
+- Result shown on crop card:
+    - green background = match
+    - red background   = mismatch
+- Fields shown: Crop text, Original text, Similarity %, Match ✅/❌, Crop confidence %
+
+-----------------------------------------------------------
+6. COMPARE BUTTON BEHAVIOR
+-----------------------------------------------------------
+- Compare button is always clickable (never disabled due to missing originalOcr)
+- If user clicks Compare before processing receipt:
+    → shows error: "Please click 'Process Receipt' first before comparing."
+
+-----------------------------------------------------------
+7. CROP CONFIDENCE SCORE
+-----------------------------------------------------------
+- Backend averages rec_scores from crop OCR run
+- Returns crop_confidence (0–1 float) in compare response
+- Frontend displays it as percentage e.g. "Crop confidence: 96.7%"
+- Returns null if no texts were detected in crop
+
+-----------------------------------------------------------
+8. BUG FIX — poly declared after use
+-----------------------------------------------------------
+- poly was declared after being used in form.append() inside handleMouseUp
+- Caused silent ReferenceError that broke the entire crop flow
+- Fixed by moving poly declaration before its use
+
+-----------------------------------------------------------
+9. BUG FIX — wrong coordinate mapping (objectFit: contain)
+-----------------------------------------------------------
+Problem:
+- img.getBoundingClientRect() returns the CSS layout box size
+- With objectFit: contain + maxHeight: 500, the image is scaled to fit
+  while preserving aspect ratio — leaving letterbox space on sides or top/bottom
+- Old code used imgRect.width/height directly for scaleX/scaleY
+- This made scaleX != scaleY for images whose aspect ratio != container aspect ratio
+- Result: crop landed in wrong position, especially for camera photos
+  (e.g. receipt on a table with extra background area)
+
+Fix applied in handleMouseUp (page.tsx):
+- Compute actual rendered image dimensions from natural aspect ratio:
+    if naturalAspect > containerAspect → constrained by width
+    else → constrained by height
+- Compute letterboxX/Y = empty space on each side
+- Subtract letterbox offset before scaling
+- Use renderedW/H (not imgRect.width/height) for scale factors
+- scaleX = naturalWidth / renderedW
+- scaleY = naturalHeight / renderedH
+- srcX = (rectX - imgOffsetX - letterboxX) * scaleX
+- srcY = (rectY - imgOffsetY - letterboxY) * scaleY
+
+-----------------------------------------------------------
+10. FULL COMPARE FLOW — end to end trace
+-----------------------------------------------------------
+Step 1 — User processes receipt (frontend)
+- User uploads image and clicks "Process Receipt"
+- Frontend sends image to /api/process → proxied to Django POST /api/process-receipt-json/
+- Django runs PaddleOCR on full receipt, returns ocr_data:
+    rec_texts  → list of all detected text strings
+    rec_polys  → polygon coordinates per text in image pixel space
+    rec_scores → confidence score per text
+- Frontend stores this as originalOcr in React state (reference for all comparisons)
+
+Step 2 — User draws a box (frontend)
+- User selects a label and draws rectangle on image
+- handleMouseUp computes rectX/Y/W/H in display pixels
+- Corrects for objectFit:contain letterboxing to get true rendered image offset
+- Multiplies by scaleX/Y = naturalWidth / renderedW to convert to image pixel space
+- Result: srcRect = { x, y, w, h } in image pixels
+- Canvas crops actual image using srcX/Y/W/H → produces PNG dataUrl
+- Both srcRect and cropped PNG stored in cropPreviews state
+
+Step 3 — User clicks Compare (frontend)
+- handleCompare sends three things to /api/compare → Django POST /api/compare-crop/:
+    1. crop_image  → cropped PNG blob
+    2. crop_meta   → JSON string { label, srcRect, poly }
+    3. original_ocr → full originalOcr (all rec_texts + rec_polys)
+
+Step 4 — Backend finds corresponding texts
+- A: OCR on crop image
+    runs ocr_image(crop_path) — PaddleOCR on the small cropped PNG
+    returns what text the crop actually contains
+- B: Filter original OCR by srcRect
+    find_texts_in_region(original_ocr, src_rect)
+    for each poly in rec_polys: compute box center
+    include text only if center (x_center, y_center) falls inside srcRect
+    this is CENTER-POINT containment (known weakness — see section 11)
+
+Step 5 — Comparison
+- compare_texts(crop_texts, original_texts)
+- Joins all texts, normalizes (lowercase, strip whitespace)
+- similarity = char matches / max(len(crop_norm), len(original_norm))
+- match = similarity >= 0.8
+- Returns: crop_text, original_text, similarity, match, crop_confidence
+
+-----------------------------------------------------------
+11. KNOWN ISSUE — find_texts_in_region uses center-point
+-----------------------------------------------------------
+Current behavior:
+- A text box from original OCR is included only if its center (x_center, y_center)
+  falls inside srcRect
+- This is inaccurate:
+    - Wide text boxes may have center inside crop but only partial text is in region
+    - Small text boxes near the edge may be excluded even if mostly inside crop
+    - Partially clipped boxes are handled incorrectly
+- Real example observed:
+    original OCR has: "CKOUT BATAX 000001101K", "0.10", "00" as separate boxes
+    all three got included because all three centers fell inside srcRect
+    this is coincidentally correct but relies on center-point luck
+
+Better approach (not yet implemented):
+- Use intersection-based matching instead of center-point
+- Include a text box if its bounding rect overlaps with srcRect:
+    box.x_min < srcRect.x+w AND box.x_max > srcRect.x
+    AND box.y_min < srcRect.y+h AND box.y_max > srcRect.y
+- Optionally require a minimum overlap ratio (e.g. 50%) for stricter matching
+
+-----------------------------------------------------------
+12. KNOWN ISSUE — compare_texts similarity is not directional
+-----------------------------------------------------------
+Current behavior:
+- Joins all crop texts and original texts into single strings
+- Normalizes (lowercase, strip whitespace)
+- Counts how many chars from crop_norm appear anywhere in original_norm
+- similarity = matches / max(len(crop_norm), len(original_norm))
+- match = similarity >= 0.8
+
+Problems:
+- Symmetric metric used for an asymmetric relationship
+- "number in" vs "his mother number in" scores low even though crop is fully contained
+- Character-level check: "123" vs "321" scores 1.0 even though order differs
+- Does not distinguish between:
+    - crop is subset of original (partial capture, original more complete)
+    - original is subset of crop (crop caught more context)
+    - genuine OCR disagreement
+- When similarity is low, no way to know which reading is correct:
+    crop OCR  → focused run on small region, less context, prone to errors on blur
+    original OCR → full image run, better context, but region filter may miss/include wrong boxes
+
+Better approach (not yet implemented):
+- Directional containment check
+- If crop text inside original → partial crop, trust original
+- If original inside crop → trust crop
+- If neither contains the other but overlap significant → flag for review
+- If near zero → wrong region or OCR failure
+- Use field-type validation to resolve conflicts:
+    Amount → validate whichever parses as valid currency
+    Date   → validate against date patterns
+    Description → needs human review
+- Use confidence scores as tiebreaker:
+    if crop_confidence high and original_score low → trust crop
+    if original_score high and crop_confidence low → trust original
+
+-----------------------------------------------------------
+13. BACKEND STRUCTURE SUMMARY
+-----------------------------------------------------------
+Endpoints:
+- POST /api/process-receipt-json/  → full OCR pipeline, returns ocr_data + image dims
+- POST /api/compare-crop/          → crop OCR + region match + text comparison
+- POST /api/process-receipt/       → legacy, returns file URLs only
+
+Services (services.py):
+- get_ocr_engine()         → singleton PaddleOCR (PP-OCRv5, CPU), reused across requests
+- run_receipt_pipeline()   → full pipeline: OCR → filter by score 0.70 → group rows → save files
+- ocr_image()              → run OCR on any image, return filtered rec_texts/scores/polys
+- find_texts_in_region()   → filter original OCR texts by srcRect (center-point, needs improvement)
+- compare_texts()          → character-level similarity between crop and original texts
+- normalize_text()         → lowercase + strip whitespace
+- group_items_into_rows()  → group text items by y_center proximity (y_tolerance=12)
+- build_plain_text()       → plain ordered text output
+- build_layout_text()      → spatially laid out text scaled to 90-char width
+
+-----------------------------------------------------------
+14. COORDINATE SYSTEM
+-----------------------------------------------------------
+- Two spaces: display coords (CSS pixels) and image pixel coords (naturalWidth/Height)
+- rec_polys from PaddleOCR → image pixel coordinates
+- srcRect → image pixel coordinates (after scale mapping in handleMouseUp)
+- Both are in the same space so find_texts_in_region works without extra scaling
+- srcRect format: { x, y, w, h } where x,y = top-left corner in image pixels
+
+-----------------------------------------------------------
+15. FILE STRUCTURE
+-----------------------------------------------------------
+frontend/nextjs-app/
+  app/
+    page.tsx                  → main UI + all handlers
+    layout.tsx                → root layout
+    api/
+      process/route.ts        → proxy to Django process-receipt-json
+      crop/
+        save/route.ts         → save crop PNG + meta JSON to frontend/crop_images/
+        delete/route.ts       → delete crop PNG + JSON from frontend/crop_images/
+      compare/route.ts        → proxy to Django compare-crop
+  lib/
+    layoutReconstruct.ts      → TypeScript port of layout reconstruction
+
+frontend/crop_images/         → saved crop PNGs and JSONs
+
+backend/Reciepts/
+  ocrapp/
+    views.py                  → home_view, process_receipt_api_view,
+                                process_receipt_json_view, compare_crop_view
+    services.py               → all OCR and text processing logic
+    urls.py                   → URL routing
+  config/
+    settings.py
+    urls.py
+  media/
+    uploads/                  → uploaded receipt images + temp crop files
+    results/{uuid}/           → per-request OCR output files
